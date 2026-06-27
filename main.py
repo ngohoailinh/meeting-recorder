@@ -3,7 +3,7 @@ import os
 import threading
 import queue
 import time
-import wave
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -124,6 +124,7 @@ class ScreenRecorder:
 class TranscriptionWorker(QObject):
     caption_ready = pyqtSignal(str)
     model_loaded = pyqtSignal()
+    error = pyqtSignal(str)
 
     def __init__(self, model_size="base"):
         super().__init__()
@@ -134,26 +135,34 @@ class TranscriptionWorker(QObject):
 
     @pyqtSlot()
     def run(self):
-        self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
-        self.model_loaded.emit()
+        try:
+            self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+            self.model_loaded.emit()
+        except Exception as e:
+            self.error.emit(f"Failed to load speech model:\n{e}\n\n{traceback.format_exc()}")
+            return
+
         self._running = True
         while self._running:
             try:
                 chunk = self._queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-            if chunk.ndim > 1:
-                chunk = chunk.mean(axis=1)
-            segments, _ = self._model.transcribe(
-                chunk,
-                language="en",
-                beam_size=1,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=300),
-            )
-            text = " ".join(seg.text for seg in segments).strip()
-            if text:
-                self.caption_ready.emit(text)
+            try:
+                if chunk.ndim > 1:
+                    chunk = chunk.mean(axis=1)
+                segments, _ = self._model.transcribe(
+                    chunk,
+                    language="en",
+                    beam_size=1,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=300),
+                )
+                text = " ".join(seg.text for seg in segments).strip()
+                if text:
+                    self.caption_ready.emit(text)
+            except Exception as e:
+                print(f"[transcription error] {e}", flush=True)
 
     def enqueue(self, chunk: np.ndarray):
         self._queue.put(chunk)
@@ -387,7 +396,12 @@ class MeetingRecorder(QMainWindow):
             self.mic_combo.addItem(name, dev_id)
 
     def _browse(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder", str(self.output_dir))
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Output Folder",
+            str(self.output_dir),
+            QFileDialog.DontUseNativeDialog,
+        )
         if folder:
             self.output_dir = Path(folder)
             self.folder_lbl.setText(folder)
@@ -401,11 +415,19 @@ class MeetingRecorder(QMainWindow):
         self._t_thread.started.connect(self._worker.run)
         self._worker.caption_ready.connect(self._on_caption)
         self._worker.model_loaded.connect(self._on_model_loaded)
+        self._worker.error.connect(self._on_transcription_error)
         self._t_thread.start()
 
     @pyqtSlot()
     def _on_model_loaded(self):
         self.status.showMessage("Ready — press Start Recording to begin")
+
+    @pyqtSlot(str)
+    def _on_transcription_error(self, msg):
+        from PyQt5.QtWidgets import QMessageBox
+        print(f"[transcription error]\n{msg}", flush=True)
+        self.status.showMessage("Speech model failed to load — captions unavailable")
+        QMessageBox.warning(self, "Speech Model Error", msg)
 
     @pyqtSlot(str)
     def _on_caption(self, text):
@@ -527,7 +549,16 @@ class MeetingRecorder(QMainWindow):
         event.accept()
 
 
+def _exception_hook(exctype, value, tb):
+    msg = "".join(traceback.format_exception(exctype, value, tb))
+    print(msg, flush=True)
+    from PyQt5.QtWidgets import QMessageBox
+    QMessageBox.critical(None, "Unhandled Error", msg)
+    sys.__excepthook__(exctype, value, tb)
+
+
 def main():
+    sys.excepthook = _exception_hook
     app = QApplication(sys.argv)
     app.setApplicationName("Meeting Recorder")
     win = MeetingRecorder()
