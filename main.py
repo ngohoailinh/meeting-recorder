@@ -284,8 +284,13 @@ class MeetingRecorder(QMainWindow):
         self.screen_rec = None
         self._chunk_thread = None
 
+        self._worker = None
+        self._t_thread = None
+        self._transcription_ready = False
+
         self._build_ui()
-        self._init_transcription()
+        # Defer heavy model loading — starts only when recording begins
+        self._schedule_transcription_init()
 
     def _build_ui(self):
         self.setWindowTitle("Meeting Recorder")
@@ -408,15 +413,22 @@ class MeetingRecorder(QMainWindow):
 
     # ── Transcription ─────────────────────────────────────────────
 
+    def _schedule_transcription_init(self):
+        # Start model loading 500ms after the window is shown so the UI appears first
+        QTimer.singleShot(500, self._init_transcription)
+
     def _init_transcription(self):
-        self._worker = TranscriptionWorker(model_size="base")
-        self._t_thread = QThread()
-        self._worker.moveToThread(self._t_thread)
-        self._t_thread.started.connect(self._worker.run)
-        self._worker.caption_ready.connect(self._on_caption)
-        self._worker.model_loaded.connect(self._on_model_loaded)
-        self._worker.error.connect(self._on_transcription_error)
-        self._t_thread.start()
+        try:
+            self._worker = TranscriptionWorker(model_size="base")
+            self._t_thread = QThread()
+            self._worker.moveToThread(self._t_thread)
+            self._t_thread.started.connect(self._worker.run)
+            self._worker.caption_ready.connect(self._on_caption)
+            self._worker.model_loaded.connect(self._on_model_loaded)
+            self._worker.error.connect(self._on_transcription_error)
+            self._t_thread.start()
+        except Exception as e:
+            self._on_transcription_error(f"Could not start transcription thread:\n{e}\n\n{traceback.format_exc()}")
 
     @pyqtSlot()
     def _on_model_loaded(self):
@@ -466,8 +478,9 @@ class MeetingRecorder(QMainWindow):
         self.is_recording = True
         self.start_time = time.monotonic()
 
-        self._chunk_thread = threading.Thread(target=self._feed_chunks, daemon=True)
-        self._chunk_thread.start()
+        if self._worker is not None:
+            self._chunk_thread = threading.Thread(target=self._feed_chunks, daemon=True)
+            self._chunk_thread.start()
 
         self.start_btn.setText("■  Stop Recording")
         self.start_btn.setProperty("recording", "true")
