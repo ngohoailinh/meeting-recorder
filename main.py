@@ -136,7 +136,7 @@ class TranscriptionWorker(QObject):
     @pyqtSlot()
     def run(self):
         try:
-            self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+            self._model = WhisperModel(self.model_size, device="cpu", compute_type="float32")
             self.model_loaded.emit()
         except Exception as e:
             self.error.emit(f"Failed to load speech model:\n{e}\n\n{traceback.format_exc()}")

@@ -66,10 +66,9 @@ try:
 except Exception as e:
     fail("faster_whisper import", e)
 
-print("[9] loading Whisper base model (may take 30–60s on first run)...")
-print("    If the script crashes here, the issue is faster-whisper/ctranslate2")
+print("[9] loading Whisper base model with float32 (int8 crashes on some CPUs)...")
 try:
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    model = WhisperModel("base", device="cpu", compute_type="float32")
     ok("WhisperModel loaded")
 except Exception as e:
     fail("WhisperModel()", e)
