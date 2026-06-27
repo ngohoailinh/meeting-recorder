@@ -5,3 +5,9 @@ vosk>=0.3.44
 mss>=9.0
 opencv-python>=4.8
 scipy>=1.11
+imageio-ffmpeg>=0.4.9
+
+# AI summary — install the provider(s) you want to use:
+anthropic>=0.50
+openai>=1.30
+google-genai>=1.0
