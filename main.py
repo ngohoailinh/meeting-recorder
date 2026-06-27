@@ -1,5 +1,5 @@
 import sys
-import os
+import json
 import threading
 import queue
 import time
@@ -15,16 +15,16 @@ import scipy.io.wavfile as wavfile
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QStatusBar, QFileDialog,
-    QComboBox, QGroupBox, QCheckBox
+    QComboBox, QGroupBox, QCheckBox, QMessageBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QObject, QThread
 from PyQt5.QtGui import QFont, QTextCursor
-from faster_whisper import WhisperModel
 
 
 SAMPLE_RATE = 16000
-CAPTION_CHUNK_SECONDS = 4
 
+
+# ── Audio recorder ────────────────────────────────────────────────────────────
 
 class AudioRecorder:
     def __init__(self, sample_rate=SAMPLE_RATE, channels=1):
@@ -42,31 +42,33 @@ class AudioRecorder:
                 devices.append((i, dev['name']))
         return devices
 
-    def start(self, device_id=None):
+    def start(self, device_id=None, chunk_callback=None):
         with self._lock:
             self.frames = []
         self.is_recording = True
 
         def callback(indata, frames, time_info, status):
-            if self.is_recording:
-                with self._lock:
-                    self.frames.append(indata.copy())
+            if not self.is_recording:
+                return
+            with self._lock:
+                self.frames.append(indata.copy())
+            if chunk_callback:
+                mono = indata.flatten()
+                pcm = np.clip(mono * 32767, -32768, 32767).astype(np.int16).tobytes()
+                chunk_callback(pcm)
 
         kwargs = dict(
             samplerate=self.sample_rate,
             channels=self.channels,
             dtype='float32',
             callback=callback,
+            blocksize=4000,  # ~250ms per callback
         )
         if device_id is not None and device_id >= 0:
             kwargs['device'] = device_id
 
         self.stream = sd.InputStream(**kwargs)
         self.stream.start()
-
-    def get_frames_snapshot(self):
-        with self._lock:
-            return list(self.frames)
 
     def stop(self):
         self.is_recording = False
@@ -81,6 +83,8 @@ class AudioRecorder:
         audio_int16 = np.clip(audio_data * 32767, -32768, 32767).astype(np.int16)
         wavfile.write(filepath, self.sample_rate, audio_int16)
 
+
+# ── Screen recorder ───────────────────────────────────────────────────────────
 
 class ScreenRecorder:
     def __init__(self, fps=10, output_path=None):
@@ -121,22 +125,28 @@ class ScreenRecorder:
             self._writer = None
 
 
-class TranscriptionWorker(QObject):
-    caption_ready = pyqtSignal(str)
-    model_loaded = pyqtSignal()
-    error = pyqtSignal(str)
+# ── Transcription worker (vosk) ───────────────────────────────────────────────
 
-    def __init__(self, model_size="base"):
+class TranscriptionWorker(QObject):
+    caption_ready  = pyqtSignal(str)   # final sentence
+    partial_ready  = pyqtSignal(str)   # in-progress text
+    model_loaded   = pyqtSignal()
+    error          = pyqtSignal(str)
+
+    def __init__(self):
         super().__init__()
-        self.model_size = model_size
         self._model = None
+        self._rec   = None
         self._queue = queue.Queue()
         self._running = False
 
     @pyqtSlot()
     def run(self):
         try:
-            self._model = WhisperModel(self.model_size, device="cpu", compute_type="float32")
+            from vosk import Model, KaldiRecognizer, SetLogLevel
+            SetLogLevel(-1)
+            self._model = Model(model_name="vosk-model-small-en-us-0.15")
+            self._rec   = KaldiRecognizer(self._model, SAMPLE_RATE)
             self.model_loaded.emit()
         except Exception as e:
             self.error.emit(f"Failed to load speech model:\n{e}\n\n{traceback.format_exc()}")
@@ -145,31 +155,30 @@ class TranscriptionWorker(QObject):
         self._running = True
         while self._running:
             try:
-                chunk = self._queue.get(timeout=1.0)
+                pcm_bytes = self._queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             try:
-                if chunk.ndim > 1:
-                    chunk = chunk.mean(axis=1)
-                segments, _ = self._model.transcribe(
-                    chunk,
-                    language="en",
-                    beam_size=1,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=300),
-                )
-                text = " ".join(seg.text for seg in segments).strip()
-                if text:
-                    self.caption_ready.emit(text)
+                if self._rec.AcceptWaveform(pcm_bytes):
+                    result = json.loads(self._rec.Result())
+                    text = result.get('text', '').strip()
+                    if text:
+                        self.caption_ready.emit(text)
+                else:
+                    partial = json.loads(self._rec.PartialResult())
+                    text = partial.get('partial', '').strip()
+                    self.partial_ready.emit(text)
             except Exception as e:
                 print(f"[transcription error] {e}", flush=True)
 
-    def enqueue(self, chunk: np.ndarray):
-        self._queue.put(chunk)
+    def enqueue(self, pcm_bytes: bytes):
+        self._queue.put(pcm_bytes)
 
     def stop(self):
         self._running = False
 
+
+# ── Stylesheet ────────────────────────────────────────────────────────────────
 
 APP_STYLE = """
 QMainWindow, QWidget {
@@ -206,7 +215,6 @@ QTextEdit {
     border-radius: 8px;
     padding: 10px;
     font-size: 13px;
-    line-height: 1.6;
     selection-background-color: #45475a;
 }
 QLabel#timerLabel {
@@ -216,11 +224,15 @@ QLabel#timerLabel {
     font-family: 'Courier New', monospace;
 }
 QLabel#timerLabel[recording="true"] { color: #f38ba8; }
-QLabel#recDot {
-    font-size: 20px;
-    color: #313244;
-}
+QLabel#recDot { font-size: 20px; color: #313244; }
 QLabel#recDot[recording="true"] { color: #f38ba8; }
+QLabel#partialLabel {
+    color: #6c7086;
+    font-style: italic;
+    font-size: 12px;
+    padding: 2px 10px 4px 10px;
+    min-height: 18px;
+}
 QComboBox {
     background-color: #313244;
     color: #cdd6f4;
@@ -270,32 +282,32 @@ def _repoll(widget):
     widget.style().polish(widget)
 
 
+# ── Main window ───────────────────────────────────────────────────────────────
+
 class MeetingRecorder(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.is_recording = False
-        self.start_time = None
-        self.output_dir = Path.home() / "MeetingRecordings"
+        self.is_recording  = False
+        self.start_time    = None
+        self.output_dir    = Path.home() / "MeetingRecordings"
         self.output_dir.mkdir(exist_ok=True)
-        self.session_dir = None
+        self.session_dir   = None
         self.transcript_lines = []
 
-        self.audio = AudioRecorder()
+        self.audio      = AudioRecorder()
         self.screen_rec = None
-        self._chunk_thread = None
-
-        self._worker = None
-        self._t_thread = None
-        self._transcription_ready = False
+        self._worker    = None
+        self._t_thread  = None
 
         self._build_ui()
-        # Defer heavy model loading — starts only when recording begins
-        self._schedule_transcription_init()
+        QTimer.singleShot(500, self._init_transcription)
+
+    # ── UI ────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self.setWindowTitle("Meeting Recorder")
-        self.setMinimumSize(720, 620)
-        self.resize(820, 680)
+        self.setMinimumSize(720, 640)
+        self.resize(820, 700)
         self.setStyleSheet(APP_STYLE)
 
         root = QWidget()
@@ -304,26 +316,24 @@ class MeetingRecorder(QMainWindow):
         vbox.setContentsMargins(22, 18, 22, 10)
         vbox.setSpacing(14)
 
-        # ── Title row ────────────────────────────────────────────
+        # Title row
         title_row = QHBoxLayout()
         title = QLabel("Meeting Recorder")
         title.setFont(QFont("Segoe UI", 20, QFont.Bold))
         title.setStyleSheet("color: #cba6f7;")
         title_row.addWidget(title)
         title_row.addStretch()
-
         self.rec_dot = QLabel("●")
         self.rec_dot.setObjectName("recDot")
         self.rec_dot.setProperty("recording", "false")
         title_row.addWidget(self.rec_dot)
-
         self.timer_label = QLabel("00:00:00")
         self.timer_label.setObjectName("timerLabel")
         self.timer_label.setProperty("recording", "false")
         title_row.addWidget(self.timer_label)
         vbox.addLayout(title_row)
 
-        # ── Settings ─────────────────────────────────────────────
+        # Settings
         settings = QGroupBox("Settings")
         sg = QVBoxLayout(settings)
 
@@ -347,17 +357,17 @@ class MeetingRecorder(QMainWindow):
         sg.addLayout(folder_row)
 
         opts_row = QHBoxLayout()
-        self.cb_screen = QCheckBox("Record screen")
+        self.cb_screen     = QCheckBox("Record screen")
         self.cb_screen.setChecked(True)
-        opts_row.addWidget(self.cb_screen)
         self.cb_transcript = QCheckBox("Save transcript")
         self.cb_transcript.setChecked(True)
+        opts_row.addWidget(self.cb_screen)
         opts_row.addWidget(self.cb_transcript)
         opts_row.addStretch()
         sg.addLayout(opts_row)
         vbox.addWidget(settings)
 
-        # ── Start / Stop button ──────────────────────────────────
+        # Start / Stop
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self.start_btn = QPushButton("▶  Start Recording")
@@ -368,32 +378,39 @@ class MeetingRecorder(QMainWindow):
         btn_row.addStretch()
         vbox.addLayout(btn_row)
 
-        # ── Live captions ────────────────────────────────────────
+        # Live captions
         caps = QGroupBox("Live Captions")
         cl = QVBoxLayout(caps)
         self.caption_box = QTextEdit()
         self.caption_box.setReadOnly(True)
-        self.caption_box.setMinimumHeight(180)
-        self.caption_box.setPlaceholderText(
-            "Live captions will appear here once recording starts…"
-        )
+        self.caption_box.setMinimumHeight(160)
+        self.caption_box.setPlaceholderText("Live captions will appear here once recording starts…")
         cl.addWidget(self.caption_box)
+
+        self.partial_label = QLabel("")
+        self.partial_label.setObjectName("partialLabel")
+        self.partial_label.setWordWrap(True)
+        cl.addWidget(self.partial_label)
 
         clear_btn = QPushButton("Clear")
         clear_btn.setObjectName("smallBtn")
         clear_btn.setFixedWidth(70)
-        clear_btn.clicked.connect(self.caption_box.clear)
+        clear_btn.clicked.connect(self._clear_captions)
         cl.addWidget(clear_btn, alignment=Qt.AlignRight)
         vbox.addWidget(caps, 1)
 
-        # ── Status bar ───────────────────────────────────────────
+        # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("Ready — loading speech recognition model…")
+        self.status.showMessage("Loading speech recognition model…")
 
         self._timer = QTimer()
         self._timer.timeout.connect(self._tick)
         self._blink_state = False
+
+    def _clear_captions(self):
+        self.caption_box.clear()
+        self.partial_label.clear()
 
     def _populate_devices(self):
         self.mic_combo.clear()
@@ -402,9 +419,7 @@ class MeetingRecorder(QMainWindow):
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Output Folder",
-            str(self.output_dir),
+            self, "Select Output Folder", str(self.output_dir),
             QFileDialog.DontUseNativeDialog,
         )
         if folder:
@@ -413,36 +428,33 @@ class MeetingRecorder(QMainWindow):
 
     # ── Transcription ─────────────────────────────────────────────
 
-    def _schedule_transcription_init(self):
-        # Start model loading 500ms after the window is shown so the UI appears first
-        QTimer.singleShot(500, self._init_transcription)
-
     def _init_transcription(self):
         try:
-            self._worker = TranscriptionWorker(model_size="base")
+            self._worker   = TranscriptionWorker()
             self._t_thread = QThread()
             self._worker.moveToThread(self._t_thread)
             self._t_thread.started.connect(self._worker.run)
-            self._worker.caption_ready.connect(self._on_caption)
             self._worker.model_loaded.connect(self._on_model_loaded)
+            self._worker.caption_ready.connect(self._on_caption)
+            self._worker.partial_ready.connect(self._on_partial)
             self._worker.error.connect(self._on_transcription_error)
             self._t_thread.start()
         except Exception as e:
-            self._on_transcription_error(f"Could not start transcription thread:\n{e}\n\n{traceback.format_exc()}")
+            self._on_transcription_error(
+                f"Could not start transcription thread:\n{e}\n\n{traceback.format_exc()}"
+            )
 
     @pyqtSlot()
     def _on_model_loaded(self):
         self.status.showMessage("Ready — press Start Recording to begin")
 
     @pyqtSlot(str)
-    def _on_transcription_error(self, msg):
-        from PyQt5.QtWidgets import QMessageBox
-        print(f"[transcription error]\n{msg}", flush=True)
-        self.status.showMessage("Speech model failed to load — captions unavailable")
-        QMessageBox.warning(self, "Speech Model Error", msg)
+    def _on_partial(self, text):
+        self.partial_label.setText(text + "…" if text else "")
 
     @pyqtSlot(str)
     def _on_caption(self, text):
+        self.partial_label.clear()
         self.transcript_lines.append(text)
         cur = self.caption_box.textCursor()
         cur.movePosition(QTextCursor.End)
@@ -451,7 +463,13 @@ class MeetingRecorder(QMainWindow):
         self.caption_box.setTextCursor(cur)
         self.caption_box.ensureCursorVisible()
 
-    # ── Recording control ─────────────────────────────────────────
+    @pyqtSlot(str)
+    def _on_transcription_error(self, msg):
+        print(f"[transcription error]\n{msg}", flush=True)
+        self.status.showMessage("Speech model failed — captions unavailable (recording still works)")
+        QMessageBox.warning(self, "Speech Model Error", msg)
+
+    # ── Recording ─────────────────────────────────────────────────
 
     def _toggle(self):
         if self.is_recording:
@@ -465,7 +483,8 @@ class MeetingRecorder(QMainWindow):
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
         device_id = self.mic_combo.currentData()
-        self.audio.start(device_id=device_id)
+        chunk_cb  = self._worker.enqueue if self._worker else None
+        self.audio.start(device_id=device_id, chunk_callback=chunk_cb)
 
         if self.cb_screen.isChecked():
             self.screen_rec = ScreenRecorder(
@@ -476,11 +495,7 @@ class MeetingRecorder(QMainWindow):
 
         self.transcript_lines = []
         self.is_recording = True
-        self.start_time = time.monotonic()
-
-        if self._worker is not None:
-            self._chunk_thread = threading.Thread(target=self._feed_chunks, daemon=True)
-            self._chunk_thread.start()
+        self.start_time   = time.monotonic()
 
         self.start_btn.setText("■  Stop Recording")
         self.start_btn.setProperty("recording", "true")
@@ -491,22 +506,13 @@ class MeetingRecorder(QMainWindow):
         _repoll(self.rec_dot)
 
         self._timer.start(500)
-        self.caption_box.clear()
+        self._clear_captions()
         self.status.showMessage(f"Recording…  →  {self.session_dir}")
-
-    def _feed_chunks(self):
-        last_len = 0
-        while self.is_recording:
-            time.sleep(CAPTION_CHUNK_SECONDS)
-            snap = self.audio.get_frames_snapshot()
-            if len(snap) > last_len:
-                chunk = np.concatenate(snap[last_len:], axis=0)
-                last_len = len(snap)
-                self._worker.enqueue(chunk)
 
     def _stop(self):
         self.is_recording = False
         self._timer.stop()
+        self.partial_label.clear()
 
         self.start_btn.setText("▶  Start Recording")
         self.start_btn.setProperty("recording", "false")
@@ -533,7 +539,6 @@ class MeetingRecorder(QMainWindow):
                 "\n".join(self.transcript_lines), encoding="utf-8"
             )
 
-        # fire status update back on main thread
         from PyQt5.QtCore import QMetaObject
         QMetaObject.invokeMethod(self, "_on_saved", Qt.QueuedConnection)
 
@@ -547,7 +552,6 @@ class MeetingRecorder(QMainWindow):
             h, r = divmod(elapsed, 3600)
             m, s = divmod(r, 60)
             self.timer_label.setText(f"{h:02d}:{m:02d}:{s:02d}")
-            # blink the dot
             self._blink_state = not self._blink_state
             self.rec_dot.setStyleSheet(
                 "color: #f38ba8;" if self._blink_state else "color: #7d3045;"
@@ -556,16 +560,19 @@ class MeetingRecorder(QMainWindow):
     def closeEvent(self, event):
         if self.is_recording:
             self._stop()
-        self._worker.stop()
-        self._t_thread.quit()
-        self._t_thread.wait(3000)
+        if self._worker:
+            self._worker.stop()
+        if self._t_thread:
+            self._t_thread.quit()
+            self._t_thread.wait(3000)
         event.accept()
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def _exception_hook(exctype, value, tb):
     msg = "".join(traceback.format_exception(exctype, value, tb))
     print(msg, flush=True)
-    from PyQt5.QtWidgets import QMessageBox
     QMessageBox.critical(None, "Unhandled Error", msg)
     sys.__excepthook__(exctype, value, tb)
 

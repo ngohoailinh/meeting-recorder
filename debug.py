@@ -59,28 +59,30 @@ try:
 except Exception as e:
     fail("sd.query_devices()", e)
 
-print("[8] faster-whisper import")
+print("[8] vosk import")
 try:
-    from faster_whisper import WhisperModel
-    ok("faster_whisper imported")
+    from vosk import Model, KaldiRecognizer, SetLogLevel
+    ok("vosk imported")
 except Exception as e:
-    fail("faster_whisper import", e)
+    fail("vosk import", e)
 
-print("[9] loading Whisper base model with float32 (int8 crashes on some CPUs)...")
+print("[9] loading vosk small English model (downloads ~40MB on first run)...")
 try:
-    model = WhisperModel("base", device="cpu", compute_type="float32")
-    ok("WhisperModel loaded")
+    SetLogLevel(-1)
+    model = Model(model_name="vosk-model-small-en-us-0.15")
+    ok("vosk model loaded")
 except Exception as e:
-    fail("WhisperModel()", e)
+    fail("vosk Model()", e)
 
 print("[10] short transcription test")
 try:
-    audio = np.zeros(16000, dtype=np.float32)
-    segs, _ = model.transcribe(audio, language="en")
-    list(segs)
-    ok("transcription works")
+    import json
+    rec = KaldiRecognizer(model, 16000)
+    silence = np.zeros(16000, dtype=np.int16).tobytes()
+    rec.AcceptWaveform(silence)
+    result = json.loads(rec.FinalResult())
+    ok(f"transcription works — result: {result}")
 except Exception as e:
-    fail("transcribe()", e)
+    fail("KaldiRecognizer transcribe", e)
 
-print("\nAll diagnostics passed — the crash is likely in the Qt event loop or threading.")
-print("Check the updated main.py for the fix.")
+print("\nAll diagnostics passed — run: python main.py")
